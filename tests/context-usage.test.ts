@@ -65,15 +65,18 @@ test("token counting reuses the encoder, preserves counts and recovers after fai
     assert.equal(estimateTokensBatch(samples), batchExpected)
 
     for (const disposalFails of [false, true]) {
+        const failedText = `${retryText} uncached failure ${disposalFails}`
+        const failedExpected = upstream.countTokens(failedText)
         failEncoding = true
         failDisposal = disposalFails
         const releasedBefore = releases
-        assert.equal(countTokens(retryText), Math.round(retryText.length / 4))
+        assert.equal(countTokens(retryText), retryExpected, "cached results do not use the encoder")
+        assert.equal(countTokens(failedText), Math.round(failedText.length / 4))
         assert.equal(releases, releasedBefore + 1)
         failEncoding = false
         failDisposal = false
         const constructedBefore = constructions
-        assert.equal(countTokens(samples[0]), expected[0])
+        assert.equal(countTokens(failedText), failedExpected)
         assert.equal(constructions, constructedBefore + 1, "retry replaces a failed encoder")
     }
 

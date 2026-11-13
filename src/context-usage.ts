@@ -8,6 +8,11 @@ import { getRequestInput, isUserPrompt } from "./messages/query"
 
 // The convenience countTokens API constructs and frees a WASM tokenizer per call.
 let tokenizer: ReturnType<typeof getAnthropicTokenizer> | undefined
+const tokenCounts = new Map<string, number>()
+const MAX_TOKEN_CACHE_ENTRIES = 2048
+const MAX_TOKEN_CACHE_CHARACTERS = 4 * 1024 * 1024
+const MAX_TOKEN_CACHE_ENTRY_CHARACTERS = 256 * 1024
+let cachedCharacters = 0
 
 export function getCurrentTokenUsage(state: SessionState, messages: WithParts[]): number {
     for (let i = messages.length - 1; i >= 0; i--) {
@@ -129,10 +134,35 @@ export function getCurrentParams(
 
 export function countTokens(text: string): number {
     if (!text) return 0
+    const cached = tokenCounts.get(text)
+    if (cached !== undefined) {
+        tokenCounts.delete(text)
+        tokenCounts.set(text, cached)
+        return cached
+    }
+
     try {
         tokenizer ??= getAnthropicTokenizer()
-        return tokenizer.encode(text.normalize("NFKC"), "all").length
+        // Match @anthropic-ai/tokenizer exactly, including Unicode normalization
+        // and special tokens. Cache by content, never by mutable message IDs.
+        const count = tokenizer.encode(text.normalize("NFKC"), "all").length
+        if (text.length <= MAX_TOKEN_CACHE_ENTRY_CHARACTERS) {
+            while (
+                tokenCounts.size >= MAX_TOKEN_CACHE_ENTRIES ||
+                cachedCharacters + text.length > MAX_TOKEN_CACHE_CHARACTERS
+            ) {
+                const oldest = tokenCounts.keys().next().value
+                if (oldest === undefined) break
+                tokenCounts.delete(oldest)
+                cachedCharacters -= oldest.length
+            }
+            tokenCounts.set(text, count)
+            cachedCharacters += text.length
+        }
+        return count
     } catch {
+        // An encoder failure must not poison future counts or cache an estimate
+        // as an exact result. Release the instance and retry lazily next time.
         try {
             tokenizer?.free()
         } catch {
