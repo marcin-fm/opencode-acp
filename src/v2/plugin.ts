@@ -23,25 +23,7 @@ import type { HostPermissionSnapshot } from "../host-permissions"
 import { startAutoUpdate } from "../update"
 import { fetchV2SessionMessages, toV2RequestMessages } from "./messages"
 import { getRequestInput, isHostInput } from "../messages/query"
-
-async function findV2ToolName(
-    ctx: Context,
-    sessionID: string,
-    callID: string,
-): Promise<string | undefined> {
-    const messages = await ctx.session.context({ sessionID })
-    for (const message of messages as Array<{ type?: string; content?: unknown[] }>) {
-        if (message.type !== "assistant") continue
-        for (const part of message.content ?? []) {
-            if (!part || typeof part !== "object") continue
-            const tool = part as { type?: string; id?: string; name?: string }
-            if ((tool.type === "tool" || tool.type === "tool-call") && tool.id === callID) {
-                return tool.name
-            }
-        }
-    }
-    return undefined
-}
+import { createV2EventHandler } from "./events"
 
 async function notifySession(ctx: Context, title: string, message: string): Promise<void> {
     try {
@@ -248,55 +230,17 @@ export const AcpV2Plugin = Plugin.define({
         })
 
         const abort = new AbortController()
-        const eventHandler = createEventHandler(registry, logger)
-        const toolNames = new Map<string, string>()
+        const eventHandler = createV2EventHandler(ctx, createEventHandler(registry, logger))
         void (async () => {
             for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
-                if (event.type === "session.idle" || event.type === "session.deleted") {
-                    await eventHandler({
-                        event: {
-                            type: event.type,
-                            properties: { sessionID: event.data.sessionID },
-                        },
+                try {
+                    await eventHandler(event)
+                } catch (error) {
+                    logger.warn("Failed to handle ACP session event", {
+                        type: event.type,
+                        error: error instanceof Error ? error.message : String(error),
                     })
-                    continue
                 }
-
-                if (
-                    event.type !== "session.tool.called" &&
-                    event.type !== "session.tool.success" &&
-                    event.type !== "session.tool.failed"
-                ) {
-                    continue
-                }
-
-                const name =
-                    toolNames.get(event.data.id) ??
-                    (await findV2ToolName(ctx, event.data.sessionID, event.data.id))
-                if (name !== "acp_compress") continue
-                toolNames.set(event.data.id, name)
-
-                const status =
-                    event.type === "session.tool.called"
-                        ? "pending"
-                        : event.type === "session.tool.success"
-                          ? "completed"
-                          : "error"
-                await eventHandler({
-                    event: {
-                        type: "message.part.updated",
-                        time: event.created,
-                        properties: {
-                            part: {
-                                type: "tool",
-                                tool: name,
-                                callID: event.data.id,
-                                messageID: event.data.assistantMessageID,
-                                state: { status, time: { completed: event.created } },
-                            },
-                        },
-                    },
-                })
             }
         })()
 
