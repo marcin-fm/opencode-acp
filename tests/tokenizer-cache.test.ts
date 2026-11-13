@@ -57,7 +57,7 @@ test("tokenizer reuse and bounded LRU recover from failures without caching esti
     countTokens(anchor)
     const cold = "old token-count cache entry"
     countTokens(cold)
-    for (let i = 0; i < 2200; i++) {
+    for (let i = 0; i < 33000; i++) {
         countTokens(`unique cache entry ${i}`)
         countTokens(anchor)
     }
@@ -67,18 +67,46 @@ test("tokenizer reuse and bounded LRU recover from failures without caching esti
     assert.equal(countTokens(cold), upstream.countTokens(cold))
     assert.equal(encodes, before + 1, "entry-count limit evicts cold entries")
 
-    // Fewer than the entry cap, but more than the total character budget.
+    // Content fingerprints must distinguish UTF-16 code units, including lone
+    // surrogates that would all collapse to U+FFFD if hashed as UTF-8.
+    const unicode = ["\ud800", "\ud801", "\udc00", "\ufffd", "😀", "Ａ", "A"]
+    for (const value of unicode) {
+        before = encodes
+        assert.equal(countTokens(value), upstream.countTokens(value))
+        assert.equal(encodes, before + 1, "distinct raw text gets its own count")
+        countTokens(value)
+        assert.equal(encodes, before + 1)
+    }
+
+    // Interleaved sessions exceed both former text-cache limits: 2,048 entries
+    // and 4 Mi characters. An unchanged history must not be re-encoded on scan.
+    const histories = [0, 1].map((session) =>
+        Array.from(
+            { length: 1200 },
+            (_, i) => `session ${session} message ${i}: ` + "record 中文 ".repeat(220),
+        ),
+    )
+    const counts = histories.map((history) => history.map(countTokens))
+    assert.ok(histories.flat().reduce((sum, text) => sum + text.length, 0) > 4 * 1024 * 1024)
+    before = encodes
+    for (let pass = 0; pass < 2; pass++) {
+        histories.forEach((history, i) => assert.deepEqual(history.map(countTokens), counts[i]))
+    }
+    assert.equal(encodes, before, "warm cross-session scans do not encode unchanged content")
+
+    // Large outputs retain only a fixed-size key, so they need no admission
+    // limit and cannot evict other entries by their character length.
     countTokens(anchor)
     for (let i = 0; i < 20; i++) countTokens(`${i}:` + "record 中文 ".repeat(25000))
     before = encodes
     countTokens(anchor)
-    assert.equal(encodes, before + 1, "character budget also bounds retained text")
+    assert.equal(encodes, before)
 
     const oversized = "large record ".repeat(25000)
     before = encodes
     const first = countTokens(oversized)
     assert.equal(first, upstream.countTokens(oversized))
     assert.equal(countTokens(oversized), first)
-    assert.equal(encodes, before + 2, "oversized strings are counted but not retained")
+    assert.equal(encodes, before + 1, "large outputs are not encoded twice")
     assert.equal(constructions, 3, "successful counts share one WASM instance")
 })
