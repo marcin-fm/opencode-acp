@@ -93,6 +93,23 @@ test("missing start events recover ordinary and compression names once from the 
     assert.equal(registry.compressionTiming.pendingByCallId.get("m:c")?.durationMs, 500)
 })
 
+test("unrelated events are ignored and missing history can be recovered later", async () => {
+    const { handle, context, fetches, registry } = fixture()
+    await handle({ type: "location.shutdown", data: {} })
+    await handle(event("session.tool.called", 100))
+    context.set("s", [
+        {
+            id: "m",
+            type: "assistant",
+            content: [null, { type: "tool", id: "c", name: "acp_compress" }],
+        },
+    ])
+    await handle(event("session.tool.called", 200))
+    await handle(event("session.tool.success", 600))
+    assert.deepEqual(fetches, ["s", "s"])
+    assert.equal(registry.compressionTiming.pendingByCallId.get("m:c")?.durationMs, 400)
+})
+
 test("pending-name storage is bounded and deletion clears only the owning session", async () => {
     const { handle, fetches } = fixture()
     for (let i = 0; i < 4100; i++) {
