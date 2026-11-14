@@ -12,7 +12,9 @@ let tokenizer: ReturnType<typeof getAnthropicTokenizer> | undefined
 const tokenCounts = new Map<string, number>()
 // Retain only fixed-size content identities, not entire histories. A character
 // budget on text keys makes repeated scans of long sessions evict one another.
-const MAX_TOKEN_CACHE_ENTRIES = 32768
+// Leave headroom for interleaved sessions: a measured shared working set exceeded
+// 46,000 inputs even though each individual history fit in 32,768 entries.
+const MAX_TOKEN_CACHE_ENTRIES = 65536
 
 export function getCurrentTokenUsage(state: SessionState, messages: WithParts[]): number {
     for (let i = messages.length - 1; i >= 0; i--) {

@@ -57,7 +57,7 @@ test("tokenizer reuse and bounded LRU recover from failures without caching esti
     countTokens(anchor)
     const cold = "old token-count cache entry"
     countTokens(cold)
-    for (let i = 0; i < 33000; i++) {
+    for (let i = 0; i < 66000; i++) {
         countTokens(`unique cache entry ${i}`)
         countTokens(anchor)
     }
@@ -93,6 +93,23 @@ test("tokenizer reuse and bounded LRU recover from failures without caching esti
         histories.forEach((history, i) => assert.deepEqual(history.map(countTokens), counts[i]))
     }
     assert.equal(encodes, before, "warm cross-session scans do not encode unchanged content")
+
+    // Each session fits the former 32,768-entry cache, but their aggregate
+    // working set does not. Round-robin scans must retain all unchanged counts.
+    const sharedHistories = Array.from({ length: 14 }, (_, session) =>
+        Array.from(
+            { length: 3400 },
+            (_, message) => `session ${session} message ${message}: tool result 中文 = ${message}`,
+        ),
+    )
+    const sharedCounts = sharedHistories.map((history) => history.map(countTokens))
+    before = encodes
+    for (let pass = 0; pass < 2; pass++) {
+        sharedHistories.forEach((history, i) =>
+            assert.deepEqual(history.map(countTokens), sharedCounts[i]),
+        )
+    }
+    assert.equal(encodes, before, "the aggregate cross-session working set stays warm")
 
     // Large outputs retain only a fixed-size key, so they need no admission
     // limit and cannot evict other entries by their character length.
