@@ -6,6 +6,7 @@ import * as _anthropicTokenizer from "@anthropic-ai/tokenizer"
 const getAnthropicTokenizer = (_anthropicTokenizer.getTokenizer ??
     (_anthropicTokenizer as any).default?.getTokenizer) as typeof _anthropicTokenizer.getTokenizer
 import { getRequestInput, isUserPrompt } from "./messages/query"
+import { currentDiagnostic } from "./diagnostics"
 
 // The convenience countTokens API constructs and frees a WASM tokenizer per call.
 let tokenizer: ReturnType<typeof getAnthropicTokenizer> | undefined
@@ -136,12 +137,18 @@ export function getCurrentParams(
 
 export function countTokens(text: string): number {
     if (!text) return 0
+    const diagnostic = currentDiagnostic()
+    const startedAt = diagnostic ? performance.now() : 0
+    let hit = false
+    let evicted = false
+    let failed = false
     try {
         // UTF-8 replaces lone surrogates; UTF-16 preserves every JS code unit.
         // Hash raw content so mutation never reuses a count by message identity.
         const key = `${text.length}:${createHash("sha256").update(text, "utf16le").digest("hex")}`
         const cached = tokenCounts.get(key)
         if (cached !== undefined) {
+            hit = true
             tokenCounts.delete(key)
             tokenCounts.set(key, cached)
             return cached
@@ -153,11 +160,12 @@ export function countTokens(text: string): number {
         const count = tokenizer.encode(text.normalize("NFKC"), "all").length
         if (tokenCounts.size >= MAX_TOKEN_CACHE_ENTRIES) {
             const oldest = tokenCounts.keys().next().value
-            if (oldest !== undefined) tokenCounts.delete(oldest)
+            if (oldest !== undefined) evicted = tokenCounts.delete(oldest)
         }
         tokenCounts.set(key, count)
         return count
     } catch {
+        failed = true
         // An encoder failure must not poison future counts or cache an estimate
         // as an exact result. Release the instance and retry lazily next time.
         try {
@@ -167,6 +175,30 @@ export function countTokens(text: string): number {
         }
         tokenizer = undefined
         return Math.round(text.length / 4)
+    } finally {
+        if (diagnostic) {
+            const cache = (diagnostic.tokenCache ??= {
+                hits: 0,
+                misses: 0,
+                evictions: 0,
+                failures: 0,
+                inputChars: 0,
+                missChars: 0,
+                countMs: 0,
+                capacity: MAX_TOKEN_CACHE_ENTRIES,
+                entries: tokenCounts.size,
+            })
+            if (hit) cache.hits++
+            else {
+                cache.misses++
+                cache.missChars += text.length
+            }
+            if (evicted) cache.evictions++
+            if (failed) cache.failures++
+            cache.inputChars += text.length
+            cache.countMs += performance.now() - startedAt
+            cache.entries = tokenCounts.size
+        }
     }
 }
 

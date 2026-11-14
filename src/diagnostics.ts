@@ -7,6 +7,19 @@ const instanceId = randomUUID()
 let sequence = 0
 const milliseconds = (value: number) => Number(value.toFixed(3))
 
+/** Request-local work; entries/capacity describe the shared module cache. */
+export interface TokenCacheDiagnostic {
+    hits: number
+    misses: number
+    evictions: number
+    failures: number
+    inputChars: number
+    missChars: number
+    countMs: number
+    capacity: number
+    entries: number
+}
+
 /** Sequential, exclusive stages within a lane; different lanes may overlap. */
 class StageTimeline {
     readonly stageMs: Record<string, number> = {}
@@ -52,6 +65,7 @@ export class ContextDiagnostic {
         blocks?: number
         activeBlocks?: number
     } = {}
+    tokenCache?: TokenCacheDiagnostic
     private readonly lanes = new Map<string, StageTimeline>()
     private status: "ok" | "skipped" | "error" = "ok"
     private skipReason?: string
@@ -109,6 +123,9 @@ export class ContextDiagnostic {
                         failedStage: this.failedStage,
                         totalMs: milliseconds(performance.now() - this.startedAt),
                         counts: this.counts,
+                        tokenCache: this.tokenCache
+                            ? { ...this.tokenCache, countMs: milliseconds(this.tokenCache.countMs) }
+                            : undefined,
                         stageMs: Object.fromEntries(
                             [...this.lanes].map(([name, lane]) => [name, lane.snapshot()]),
                         ),

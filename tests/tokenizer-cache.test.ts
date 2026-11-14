@@ -1,6 +1,8 @@
 import assert from "node:assert/strict"
 import { createRequire } from "node:module"
 import { test } from "node:test"
+import { diagnoseContext, type TokenCacheDiagnostic } from "../src/diagnostics"
+import { Logger } from "../src/logger"
 
 test("tokenizer reuse and bounded LRU recover from failures without caching estimates", async (t) => {
     const upstream = createRequire(import.meta.url)(
@@ -30,14 +32,27 @@ test("tokenizer reuse and bounded LRU recover from failures without caching esti
         return tokenizer
     })
     const { countTokens } = await import("../src/context-usage")
+    const cacheRecords: TokenCacheDiagnostic[] = []
+    const logger = new Logger(false, "info")
+    logger.diagnostic = async (_event, data) => {
+        const cache = (data as { tokenCache?: TokenCacheDiagnostic }).tokenCache
+        if (cache) cacheRecords.push(cache)
+    }
+    const measured = (callback: () => void) =>
+        diagnoseContext(logger, "cache-test", async () => callback())
     const text = "中文".repeat(10)
     const exact = upstream.countTokens(text)
     assert.notEqual(exact, Math.round(text.length / 4))
     assert.equal(countTokens(""), 0)
     assert.equal(constructions, 0, "empty inputs do not initialize WASM")
-    assert.equal(countTokens(text), Math.round(text.length / 4))
+    await measured(() => assert.equal(countTokens(text), Math.round(text.length / 4)))
+    assert.equal(cacheRecords.at(-1)!.failures, 1)
+    assert.equal(cacheRecords.at(-1)!.misses, 1)
+    assert.equal(cacheRecords.at(-1)!.entries, 0, "failed counts are not cached")
     failConstruction = false
-    assert.equal(countTokens(text), exact, "failed estimates are retried")
+    await measured(() => assert.equal(countTokens(text), exact, "failed estimates are retried"))
+    assert.equal(cacheRecords.at(-1)!.failures, 0)
+    assert.equal(cacheRecords.at(-1)!.misses, 1)
     assert.equal(constructions, 2)
     const beforeRepeat = encodes
     assert.equal(countTokens(text), exact)
@@ -45,7 +60,10 @@ test("tokenizer reuse and bounded LRU recover from failures without caching esti
 
     failEncoding = true
     const retryText = `${text} retry`
-    assert.equal(countTokens(retryText), Math.round(retryText.length / 4))
+    await measured(() => assert.equal(countTokens(retryText), Math.round(retryText.length / 4)))
+    assert.equal(cacheRecords.at(-1)!.failures, 1)
+    assert.equal(cacheRecords.at(-1)!.misses, 1)
+    assert.equal(cacheRecords.at(-1)!.entries, 1)
     assert.equal(releases, 1)
     failEncoding = false
     assert.equal(countTokens(retryText), upstream.countTokens(retryText))
@@ -57,10 +75,18 @@ test("tokenizer reuse and bounded LRU recover from failures without caching esti
     countTokens(anchor)
     const cold = "old token-count cache entry"
     countTokens(cold)
-    for (let i = 0; i < 66000; i++) {
-        countTokens(`unique cache entry ${i}`)
-        countTokens(anchor)
-    }
+    await measured(() => {
+        for (let i = 0; i < 66000; i++) {
+            countTokens(`unique cache entry ${i}`)
+            countTokens(anchor)
+        }
+    })
+    const overflow = cacheRecords.at(-1)!
+    assert.equal(overflow.hits, 66000)
+    assert.equal(overflow.misses, 66000)
+    assert.equal(overflow.evictions, 66000 + 4 - overflow.capacity)
+    assert.equal(overflow.entries, overflow.capacity)
+    assert.equal(overflow.failures, 0)
     let before = encodes
     countTokens(anchor)
     assert.equal(encodes, before)

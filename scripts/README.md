@@ -39,7 +39,14 @@ Context diagnostics use the existing ACP `logLevel` and Logger sink; no new conf
 
 Completion logging is best effort: process crashes, hard hangs, or write failures may leave no summary. A debug start without a completion does not by itself prove an unfinished request. Stage durations are elapsed wall time, exclusive within each lane, not exclusive CPU attribution. The `context` and `transform` lanes overlap because transform work is included in its parent context stage; do not add them together.
 
-The current runtime does not collect token workload counters and omits `tokens`. The summary reader accepts optional counters for compatible records, but reports missing measurements as unavailable, not zero.
+The runtime records `tokenCache` when a context request calls `countTokens` with nonempty text:
+
+- `hits`, `misses`, `evictions`, and `failures` count that request's synchronous work. A failed lookup/encoding is a miss and a failure; its approximate fallback is never cached.
+- `inputChars` and `missChars` measure raw UTF-16 code units across all nonempty calls and misses respectively, including repeated input. They are not token counts or retained memory.
+- `countMs` is elapsed time inside those calls, including hashing, lookup, cold tokenizer construction, encoding, and failure cleanup. It is included in stage durations, not additional time or exclusive CPU attribution.
+- `capacity` and `entries` describe the module-shared bounded cache at this request's **last nonempty count**, not a per-session allocation or an end-of-request snapshot. Other requests can change occupancy before completion.
+
+Counters are request-local across concurrent/nested asynchronous work; calls outside a live diagnostic scope are not attributed to completed requests. No input text or fingerprints are logged. Requests with no nonempty counts omit `tokenCache`; missing measurements, including older records, are unavailable rather than zero. `silent` disables collection with diagnostics. This telemetry does not collect the older optional `tokens` workload fields; the reader still accepts those for compatible records.
 
 ### Offline summary
 
@@ -67,6 +74,7 @@ The JSON summary includes:
 - `totalMs`: exact nearest-rank `p50`, `p95`, and `max` across those completions. Nearest rank uses `ceil(percentile * count)`; empty samples produce `null`.
 - `stageMs.context` and `stageMs.transform`: stages ranked by descending total milliseconds, with `records`, `totalMs`, and `meanMs`. A stage's mean includes only records containing that stage. The transform lane is child work included in the context lane: **do not add the lanes together** or treat their stage totals as independent wall time.
 - `tokenWorkload`: `measuredRecords`, `unavailableRecords`, validated counter `totals`, and `fallbackRatio` (`fullHistoryFallback / usageCalls`). Counters may be absent; missing counters are unavailable, never measured zeros. Only records containing the complete validated `tokens` object contribute to token totals and the ratio. Totals are `null` when no records contain counters; the ratio is `null` when there are no measured usage calls. A present but invalid `tokens` object makes the diagnostic line malformed.
+- `tokenCache`: measured/unavailable records, counter totals, and `hitRatio` (`hits / (hits + misses)`). Occupancy is not additive: `capacities` lists observed bounds, `maxEntries` is the largest observed occupancy, and `atCapacityRecords` counts full-cache observations. A full cache alone does not establish thrashing; sustained misses/evictions and counting time distinguish it from successful reuse. Missing cache telemetry contributes no counters; incomplete/invalid telemetry makes a line malformed. Ratios/totals/max occupancy are `null` when unavailable.
 - `versions`: completion counts by plugin version. Supported schema records can span plugin versions; unsupported schema records are excluded rather than mixed silently.
 - `duplicateRecords`, `filteredRecords`, and `ignoredLines`: excluded duplicate completions, valid records outside the requested session, and unrelated lines.
 

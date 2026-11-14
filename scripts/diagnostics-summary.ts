@@ -4,6 +4,7 @@ import { createReadStream } from "node:fs"
 import { resolve } from "node:path"
 import { createInterface } from "node:readline"
 import { pathToFileURL } from "node:url"
+import type { TokenCacheDiagnostic } from "../src/diagnostics"
 
 const TOKEN_KEYS = [
     "usageCalls",
@@ -18,6 +19,16 @@ const TOKEN_KEYS = [
 ] as const
 
 type TokenCounters = Record<(typeof TOKEN_KEYS)[number], number>
+const CACHE_COUNTER_KEYS = [
+    "hits",
+    "misses",
+    "evictions",
+    "failures",
+    "inputChars",
+    "missChars",
+    "countMs",
+] as const
+type CacheCounters = Pick<TokenCacheDiagnostic, (typeof CACHE_COUNTER_KEYS)[number]>
 type Lane = "context" | "transform"
 
 export interface ContextDiagnosticRecord {
@@ -33,6 +44,7 @@ export interface ContextDiagnosticRecord {
     counts: Record<string, number>
     stageMs: Partial<Record<Lane, Record<string, number>>>
     tokens?: TokenCounters
+    tokenCache?: TokenCacheDiagnostic
     version: string
 }
 
@@ -104,6 +116,21 @@ export function parseDiagnosticLine(line: string): DiagnosticLineResult {
     ) {
         return { kind: "malformed" }
     }
+    if (payload.tokenCache !== undefined) {
+        const cache = payload.tokenCache
+        if (
+            !isObject(cache) ||
+            ![...CACHE_COUNTER_KEYS, "capacity", "entries"].every((key) =>
+                isNonnegativeNumber(cache[key]),
+            ) ||
+            !Number.isInteger(cache.capacity) ||
+            !Number.isInteger(cache.entries) ||
+            (cache.capacity as number) <= 0 ||
+            (cache.entries as number) > (cache.capacity as number)
+        ) {
+            return { kind: "malformed" }
+        }
+    }
     return { kind: "diagnostic", record: payload as unknown as ContextDiagnosticRecord }
 }
 
@@ -137,6 +164,13 @@ export class DiagnosticsAggregator {
         TOKEN_KEYS.map((key) => [key, 0]),
     ) as TokenCounters
     private measuredTokenRecords = 0
+    private readonly cacheTotals = Object.fromEntries(
+        CACHE_COUNTER_KEYS.map((key) => [key, 0]),
+    ) as CacheCounters
+    private readonly cacheCapacities = new Set<number>()
+    private measuredCacheRecords = 0
+    private maxCacheEntries = 0
+    private atCapacityRecords = 0
     private malformedLines = 0
     private ignoredLines = 0
     private duplicateRecords = 0
@@ -185,6 +219,14 @@ export class DiagnosticsAggregator {
             this.measuredTokenRecords++
             for (const key of TOKEN_KEYS) this.tokenTotals[key] += record.tokens[key]
         }
+        if (record.tokenCache !== undefined) {
+            const cache = record.tokenCache
+            this.measuredCacheRecords++
+            for (const key of CACHE_COUNTER_KEYS) this.cacheTotals[key] += cache[key]
+            this.cacheCapacities.add(cache.capacity)
+            this.maxCacheEntries = Math.max(this.maxCacheEntries, cache.entries)
+            if (cache.entries === cache.capacity) this.atCapacityRecords++
+        }
     }
 
     summary() {
@@ -214,6 +256,18 @@ export class DiagnosticsAggregator {
                     this.tokenTotals.usageCalls > 0
                         ? this.tokenTotals.fullHistoryFallback / this.tokenTotals.usageCalls
                         : null,
+            },
+            tokenCache: {
+                measuredRecords: this.measuredCacheRecords,
+                unavailableRecords: this.durations.length - this.measuredCacheRecords,
+                totals: this.measuredCacheRecords ? { ...this.cacheTotals } : null,
+                hitRatio:
+                    this.cacheTotals.hits + this.cacheTotals.misses > 0
+                        ? this.cacheTotals.hits / (this.cacheTotals.hits + this.cacheTotals.misses)
+                        : null,
+                capacities: [...this.cacheCapacities].sort((a, b) => a - b),
+                maxEntries: this.measuredCacheRecords ? this.maxCacheEntries : null,
+                atCapacityRecords: this.atCapacityRecords,
             },
             versions: Object.fromEntries(this.versions),
             malformedDiagnosticLines: this.malformedLines,

@@ -22,6 +22,17 @@ const record = (overrides: Record<string, unknown> = {}) => ({
 })
 const line = (payload: Record<string, unknown>) =>
     `2026-10-31T00:00:00.000Z INFO  diagnostics: context | ${JSON.stringify(payload)} | v=fixture`
+const cache = {
+    hits: 3,
+    misses: 1,
+    evictions: 1,
+    failures: 0,
+    inputChars: 80,
+    missChars: 20,
+    countMs: 2.5,
+    capacity: 65536,
+    entries: 65536,
+}
 
 test("summary classifies malformed and unsupported data without inventing measurements", () => {
     const invalid = [
@@ -29,6 +40,10 @@ test("summary classifies malformed and unsupported data without inventing measur
         line(record({ totalMs: -1 })),
         line(record({ stageMs: { unknown: { stage: 1 } } })),
         line(record({ tokens: { usageCalls: 0 } })),
+        line(record({ tokenCache: { hits: 0 } })),
+        line(record({ tokenCache: { ...cache, countMs: -1 } })),
+        line(record({ tokenCache: { ...cache, entries: cache.capacity + 1 } })),
+        line(record({ tokenCache: { ...cache, capacity: 0, entries: 0 } })),
     ]
     for (const value of invalid) assert.equal(parseDiagnosticLine(value).kind, "malformed")
     const result = summarizeDiagnostics([
@@ -48,6 +63,15 @@ test("summary classifies malformed and unsupported data without inventing measur
         fallbackRatio: null,
     })
     assert.equal(summarizeDiagnostics([]).totalMs.p95, null)
+    assert.deepEqual(result.tokenCache, {
+        measuredRecords: 0,
+        unavailableRecords: 1,
+        totals: null,
+        hitRatio: null,
+        capacities: [],
+        maxEntries: null,
+        atCapacityRecords: 0,
+    })
 })
 
 test("summary filters sessions, deduplicates completions and keeps overlapping lanes separate", () => {
@@ -100,6 +124,45 @@ test("optional token measurements are aggregated only when present and complete"
         unavailableRecords: 1,
         totals: tokens,
         fallbackRatio: 0.5,
+    })
+})
+
+test("cache summaries mix old records safely and never add occupancy gauges", () => {
+    const first = line(record({ tokenCache: cache }))
+    const result = summarizeDiagnostics(
+        [
+            first,
+            first,
+            line(record({ traceId: "old" })),
+            line(
+                record({
+                    traceId: "other-instance",
+                    instanceId: "other-instance",
+                    tokenCache: { ...cache, capacity: 32768, entries: 12 },
+                }),
+            ),
+            line(record({ traceId: "excluded", sessionId: "other", tokenCache: cache })),
+        ],
+        "session",
+    )
+    assert.equal(result.duplicateRecords, 1)
+    assert.equal(result.filteredRecords, 1)
+    assert.deepEqual(result.tokenCache, {
+        measuredRecords: 2,
+        unavailableRecords: 1,
+        totals: {
+            hits: 6,
+            misses: 2,
+            evictions: 2,
+            failures: 0,
+            inputChars: 160,
+            missChars: 40,
+            countMs: 5,
+        },
+        hitRatio: 0.75,
+        capacities: [32768, 65536],
+        maxEntries: 65536,
+        atCapacityRecords: 1,
     })
 })
 
