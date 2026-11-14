@@ -96,10 +96,19 @@ export function archiveSessionImages(
     for (const message of messages) {
         const rawId = message.info.id
         if (!rawId) continue
-        const parts = Array.isArray(message.parts) ? message.parts : []
+        const parts = (Array.isArray(message.parts) ? message.parts : []).flatMap(
+            (part, partIndex) => [
+                { part, partIndex: String(partIndex) },
+                ...(part.type === "tool" && Array.isArray(part.state?.content)
+                    ? part.state.content.map((content: unknown, contentIndex: number) => ({
+                          part: content,
+                          partIndex: `${partIndex}-c${contentIndex}`,
+                      }))
+                    : []),
+            ],
+        )
 
-        for (let partIndex = 0; partIndex < parts.length; partIndex++) {
-            const part = parts[partIndex]
+        for (const { part, partIndex } of parts) {
             if (part.type !== "file") continue
             const parsed = parseImageDataUrl(part.url)
             if (!parsed) continue

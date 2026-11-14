@@ -513,6 +513,7 @@ export function planCompressionCandidates(
             ? {
                   plans: preparedPlan ? [preparedPlan] : [],
                   totalChars: preparedPlan ? unit.retainedChars : 0,
+                  protectedMessageIds: batchResult.protectedMessageIds,
               }
             : undefined
         const validated = validateDraft(

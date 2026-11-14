@@ -64,6 +64,8 @@ export interface ToolPart {
         status: string
         input?: unknown
         output?: string
+        /** Structured media output; `output` is its transformable text projection. */
+        content?: Array<TextPart | FilePart>
         time?: { start?: number; end?: number; completed?: number }
         [key: string]: unknown
     }

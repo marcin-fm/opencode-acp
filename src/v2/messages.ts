@@ -1,3 +1,4 @@
+import { Media } from "@opencode/ai"
 import type { WithParts } from "../state"
 
 type V2Message = {
@@ -14,6 +15,7 @@ type V2Message = {
     files?: Array<{
         data?: string
         mime?: string
+        name?: string
         source?: { type?: string; uri?: string }
     }>
 }
@@ -56,10 +58,40 @@ function textFromContent(value: unknown): string {
     return typeof value === "object" ? JSON.stringify(value) : String(value)
 }
 
+function toolContent(value: unknown): Array<Record<string, unknown>> | undefined {
+    if (!Array.isArray(value)) return undefined
+    const content = value.map((item) => {
+        if (item && typeof item === "object" && item.type === "file") {
+            if (typeof item.uri !== "string" || typeof item.mime !== "string") {
+                throw new Error("ACP: malformed V2 tool file content")
+            }
+            return {
+                type: "file",
+                url: item.uri,
+                mime: item.mime,
+                ...(typeof item.name === "string" ? { filename: item.name } : {}),
+            }
+        }
+        return { type: "text", text: textFromContent([item]) }
+    })
+    return content.some((item) => item.type === "file") ? content : undefined
+}
+
+function toolContentText(content: Array<Record<string, unknown>>): string {
+    return content
+        .filter((item) => item.type === "text")
+        .map((item) => item.text as string)
+        .filter(Boolean)
+        .join("\n")
+}
+
 function convertToolPart(part: V2ToolPart): Record<string, unknown> {
     const state = part.state
     const status = state?.status ?? (part.result !== undefined ? "completed" : "pending")
-    const output = state?.content ?? state?.error ?? part.result
+    const result = part.result as { type?: string; value?: unknown } | undefined
+    const output =
+        state?.content ?? state?.error ?? (result?.type === "content" ? result.value : part.result)
+    const content = toolContent(output)
 
     return {
         type: "tool",
@@ -68,7 +100,8 @@ function convertToolPart(part: V2ToolPart): Record<string, unknown> {
         state: {
             status,
             input: state?.input ?? part.input,
-            output: textFromContent(output),
+            output: content ? toolContentText(content) : textFromContent(output),
+            ...(content ? { content } : {}),
             ...(state?.metadata?.acpHostInputRefs === true
                 ? { metadata: { acpHostInputRefs: true } }
                 : {}),
@@ -84,11 +117,14 @@ function convertParts(message: V2Message): unknown[] {
         }
         for (const file of message.files ?? []) {
             if (typeof file.data !== "string" || typeof file.mime !== "string") continue
-            const url =
-                file.source?.type === "uri" && file.source.uri
-                    ? file.source.uri
-                    : `data:${file.mime};base64,${file.data}`
-            parts.push({ type: "file", url, mime: file.mime })
+            // Match OpenCode's attachment lowering: the durable bytes are the
+            // payload; source.uri is provenance, not a replacement for them.
+            parts.push({
+                type: "file",
+                url: `data:${file.mime};base64,${file.data}`,
+                mime: file.mime,
+                ...(typeof file.name === "string" ? { filename: file.name } : {}),
+            })
         }
         return parts
     }
@@ -232,13 +268,42 @@ function toV2ToolCall(part: Record<string, unknown>): Record<string, unknown> {
 
 function toV2ToolResult(part: Record<string, unknown>): Record<string, unknown> {
     const state = (part.state ?? {}) as Record<string, unknown>
+    const content = state.content as Array<Record<string, unknown>> | undefined
+    let result: Record<string, unknown> = {
+        type: state.status === "error" ? "error" : "text",
+        value: state.output ?? "",
+    }
+    if (content && state.status !== "error") {
+        // ACP edits the text projection (tags, truncation, etc.). Only replay
+        // the original text blocks while that projection is unchanged; never
+        // resurrect discarded text alongside the preserved media.
+        const unchanged = state.output === toolContentText(content)
+        let textInserted = false
+        const value: Array<Record<string, unknown>> = []
+        for (const item of content) {
+            if (item.type === "file") {
+                value.push({
+                    type: "file",
+                    uri: item.url,
+                    mime: item.mime,
+                    ...(typeof item.filename === "string" ? { name: item.filename } : {}),
+                })
+            } else if (unchanged) {
+                value.push({ type: "text", text: item.text })
+            } else if (!textInserted) {
+                if (state.output) value.push({ type: "text", text: state.output })
+                textInserted = true
+            }
+        }
+        if (!unchanged && !textInserted && state.output) {
+            value.push({ type: "text", text: state.output })
+        }
+        result = { type: "content", value }
+    }
     return {
         type: "tool-result",
         ...toolIdentity(part),
-        result: {
-            type: state.status === "error" ? "error" : "text",
-            value: state.output ?? "",
-        },
+        result,
     }
 }
 
@@ -254,6 +319,17 @@ function toV2Content(part: Record<string, unknown>): Record<string, unknown> | u
         return state.status === "completed" || state.status === "error"
             ? toV2ToolResult(part)
             : toV2ToolCall(part)
+    }
+    if (part.type === "file" && typeof part.url === "string") {
+        return {
+            type: "media",
+            media:
+                Media.parseDataUrl(part.url) ??
+                Media.url(part.url, {
+                    mediaType: typeof part.mime === "string" ? part.mime : undefined,
+                }),
+            ...(typeof part.filename === "string" ? { filename: part.filename } : {}),
+        }
     }
     return undefined
 }

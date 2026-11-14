@@ -155,13 +155,11 @@ export function createCompressRangeTool(factoryCtx: ToolFactoryContext): V2ToolI
             // Intentionally runs after prepareSession: resolution and char accounting
             // require the prepared search context, and no state is persisted on error.
             // Use the effective provider/model config so planning and execution agree.
-            const { plans: filteredPlans, totalChars } = prepareExecutableRangePlans(
-                input,
-                searchContext,
-                ctx.state,
-                ctx.config,
-                ctx.logger,
-            )
+            const {
+                plans: filteredPlans,
+                totalChars,
+                protectedMessageIds,
+            } = prepareExecutableRangePlans(input, searchContext, ctx.state, ctx.config, ctx.logger)
             if (needsSmartPlan) {
                 validateSmartPlan(
                     toolCtx.sessionID,
@@ -404,9 +402,18 @@ export function createCompressRangeTool(factoryCtx: ToolFactoryContext): V2ToolI
             const ackNote = ignoredAcknowledgeRisk
                 ? `\n⚠️ acknowledgeRisk was ignored: no quality gate rejection was pending, so quality checks ran normally. Only pass it when retrying immediately after a quality gate rejection.\n`
                 : ""
+            const protectedNote =
+                protectedMessageIds.length > 0
+                    ? `\n⚠️ ${protectedMessageIds.length} requested message(s) were NOT compressed because of protected-tool, last-user, or recent-message protection: ${protectedMessageIds
+                          .slice(0, 12)
+                          .map((id) => ctx.state.messageIds.byRawId.get(id) ?? id)
+                          .join(
+                              ", ",
+                          )}${protectedMessageIds.length > 12 ? ", …" : ""}. Their content, including any images, remains in visible context.\n`
+                    : ""
             return {
                 metadata: { acpHostInputRefs: true },
-                content: `Compressed ${totalCompressedMessages} messages into ${COMPRESSED_BLOCK_HEADER}.${skippedNote}${ackNote}\nIMPORTANT: This was an automatic context compression. You MUST continue your previous task exactly where you left off. Do NOT ask the user what to do next.\n💡 Tip: Use acp_search_context('keyword') to find compressed content when you need it later.`,
+                content: `Compressed ${totalCompressedMessages} messages into ${COMPRESSED_BLOCK_HEADER}.${skippedNote}${ackNote}${protectedNote}\nIMPORTANT: This was an automatic context compression. You MUST continue your previous task exactly where you left off. Do NOT ask the user what to do next.\n💡 Tip: Use acp_search_context('keyword') to find compressed content when you need it later.`,
             }
         },
     }
