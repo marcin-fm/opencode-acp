@@ -109,8 +109,9 @@ function convertToolPart(part: V2ToolPart): Record<string, unknown> {
     }
 }
 
-function convertParts(message: V2Message): unknown[] {
+function convertParts(message: V2Message, hostUserParts?: unknown[]): unknown[] {
     if (message.type === "user" || message.type === "synthetic") {
+        if (hostUserParts !== undefined) return hostUserParts
         const parts: unknown[] = []
         if (typeof message.text === "string") {
             parts.push({ type: "text", text: message.text })
@@ -184,6 +185,8 @@ export function fromV2SessionMessages(
     }
 
     const result: WithParts[] = []
+    const hostUserParts =
+        requestMessages === undefined ? undefined : indexHostUserParts(requestMessages)
     for (const value of input) {
         if (!value || typeof value !== "object") continue
         const message = value as V2Message
@@ -223,7 +226,7 @@ export function fromV2SessionMessages(
                 ? [{ type: "text", text: projectedContent }]
                 : Array.isArray(projectedContent)
                   ? projectedContent.map((part) => structuredClone(part))
-                  : convertParts(message)
+                  : convertParts(message, hostUserParts?.get(message.id))
         result.push({
             info: info as WithParts["info"],
             parts: parts as WithParts["parts"],
@@ -307,7 +310,91 @@ function toV2ToolResult(part: Record<string, unknown>): Record<string, unknown> 
     }
 }
 
-function toV2Content(part: Record<string, unknown>): Record<string, unknown> | undefined {
+function mediaKey(url: string): string {
+    if (!url.startsWith("data:")) return url
+    const separator = url.indexOf(";base64,")
+    if (separator === -1) return url
+    return url.slice(0, separator).toLowerCase() + url.slice(separator)
+}
+
+function hostMediaUrl(value: unknown): string | undefined {
+    if (!value || typeof value !== "object") return undefined
+    const asset = value as {
+        inline?: () => { dataUrl: string } | undefined
+        source?: { type?: string; url?: string }
+    }
+    return (
+        (typeof asset.inline === "function" ? asset.inline()?.dataUrl : undefined) ??
+        (asset.source?.type === "url" ? asset.source.url : undefined)
+    )
+}
+
+function indexHostUserParts(messages: readonly unknown[]) {
+    const index = new Map<string, unknown[]>()
+    for (const value of messages) {
+        if (!value || typeof value !== "object") continue
+        const message = value as { id?: unknown; role?: unknown; content?: unknown }
+        if (
+            typeof message.id !== "string" ||
+            message.role !== "user" ||
+            !Array.isArray(message.content)
+        ) {
+            continue
+        }
+        // OpenCode already lowers text/directory attachments and deduplicates
+        // inline image mentions. Transform that view, not a second lowering.
+        const parts: unknown[] = []
+        for (const value of message.content) {
+            if (!value || typeof value !== "object") continue
+            const part = value as Record<string, unknown>
+            if (part.type === "text" && typeof part.text === "string") {
+                parts.push({ type: "text", text: part.text })
+            } else if (part.type === "media") {
+                const url = hostMediaUrl(part.media)
+                if (typeof url !== "string") {
+                    throw new Error(`ACP: unsupported host media for message ${message.id}`)
+                }
+                const asset = part.media as { mediaType?: string }
+                parts.push({
+                    type: "file",
+                    url,
+                    mime: asset.mediaType ?? "application/octet-stream",
+                    ...(typeof part.filename === "string" ? { filename: part.filename } : {}),
+                })
+            }
+        }
+        index.set(message.id, parts)
+    }
+    return index
+}
+
+function indexHostMedia(messages: readonly unknown[]) {
+    const index = new Map<string, Map<string, Array<Record<string, unknown>>>>()
+    for (const value of messages) {
+        if (!value || typeof value !== "object") continue
+        const message = value as { id?: unknown; content?: unknown }
+        if (typeof message.id !== "string" || !Array.isArray(message.content)) continue
+        for (const value of message.content) {
+            if (!value || typeof value !== "object") continue
+            const part = value as Record<string, unknown>
+            if (part.type !== "media") continue
+            const url = hostMediaUrl(part.media)
+            if (typeof url !== "string") continue
+            let byUrl = index.get(message.id)
+            if (!byUrl) index.set(message.id, (byUrl = new Map()))
+            const key = mediaKey(url)
+            const entries = byUrl.get(key) ?? []
+            entries.push(part)
+            byUrl.set(key, entries)
+        }
+    }
+    return index
+}
+
+function toV2Content(
+    part: Record<string, unknown>,
+    hostMedia?: (part: Record<string, unknown>) => Record<string, unknown>,
+): Record<string, unknown> | undefined {
     if (part.type === "text") {
         return { type: "text", text: typeof part.text === "string" ? part.text : "" }
     }
@@ -321,6 +408,7 @@ function toV2Content(part: Record<string, unknown>): Record<string, unknown> | u
             : toV2ToolCall(part)
     }
     if (part.type === "file" && typeof part.url === "string") {
+        if (hostMedia) return hostMedia(part)
         return {
             type: "media",
             media:
@@ -334,11 +422,35 @@ function toV2Content(part: Record<string, unknown>): Record<string, unknown> | u
     return undefined
 }
 
-/** Convert the internal post-transform view back to V2 model messages. */
-export function toV2RequestMessages(messages: WithParts[]): unknown[] {
+/**
+ * Convert the internal post-transform view back to V2 model messages. At the
+ * context-hook boundary, media must belong to the host's SDK, not our copy.
+ */
+export function toV2RequestMessages(
+    messages: WithParts[],
+    originalMessages?: readonly unknown[],
+): unknown[] {
     const result: unknown[] = []
+    const hostMedia = originalMessages === undefined ? undefined : indexHostMedia(originalMessages)
 
     for (const message of messages) {
+        const resolveMedia =
+            hostMedia === undefined
+                ? undefined
+                : (part: Record<string, unknown>) => {
+                      const entries = hostMedia
+                          .get(message.info.id)
+                          ?.get(mediaKey(part.url as string))
+                      const index =
+                          entries?.findIndex((candidate) => candidate.filename === part.filename) ??
+                          -1
+                      if (!entries || index === -1) {
+                          throw new Error(`ACP: missing host media for message ${message.info.id}`)
+                      }
+                      // Preserve the native asset and attachment metadata. Only
+                      // transformed parts are replayed; never restore removed media.
+                      return entries.splice(index, 1)[0]
+                  }
         const content: Record<string, unknown>[] = []
         const toolResults: Record<string, unknown>[] = []
         for (const value of message.parts) {
@@ -351,7 +463,7 @@ export function toV2RequestMessages(messages: WithParts[]): unknown[] {
                 }
                 continue
             }
-            const converted = toV2Content(part)
+            const converted = toV2Content(part, resolveMedia)
             if (converted !== undefined) content.push(converted)
         }
 

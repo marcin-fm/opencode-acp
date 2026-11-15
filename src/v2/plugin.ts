@@ -197,7 +197,10 @@ export const AcpV2Plugin = Plugin.define({
                 await transformMessages({}, output)
                 if (diagnostic) diagnostic.counts.outputMessages = output.messages.length
                 checkpoint("convertRequestMessages")
-                event.messages = toV2RequestMessages(output.messages) as typeof event.messages
+                event.messages = toV2RequestMessages(
+                    output.messages,
+                    event.messages,
+                ) as typeof event.messages
                 const state = registry.get(event.sessionID)
                 if (state) {
                     state.visibleHostInputIds = new Set(
