@@ -10,8 +10,7 @@ import { ensureSessionInitialized } from "../state"
 import { saveSessionState } from "../state/persistence"
 import { assignMessageRefs } from "../message-ids"
 import { syncCompressionBlocks } from "../messages"
-import { getCurrentTokenUsage, extractToolContent } from "../context-usage"
-import { resolveEffectiveContextLimit } from "../state/utils"
+import { extractToolContent } from "../context-usage"
 import {
     fetchSessionMessages,
     buildSearchContext,
@@ -31,6 +30,7 @@ import {
     buildRestoredContentPreview,
     checkDecompressSourceAvailability,
 } from "./decompress-logic"
+import { projectDecompression } from "./decompress-budget"
 import { formatTokenCount } from "../ui/utils"
 
 interface RunContext {
@@ -219,6 +219,8 @@ IMPORTANT:
 - TIER-AWARE: by default, decompressing a multi-tier block restores the PREVIOUS tier's
   summaries (e.g., decompress T2 → T1 summaries visible, not raw messages). Use full:true
   to restore all the way to original messages (can be very expensive for T2/T3 blocks).
+- Context-growing decompression is refused if the projected input exceeds the model
+  (or configured fallback) budget. Use toFile to read specific sections without inflating context.
 - After decompression, the restored content will appear in full in your next context window.
 - Do NOT call this tool in parallel with compress — their state mutations may conflict.`
 
@@ -264,7 +266,7 @@ type MessagePart = WithParts["parts"][number]
 
 // Only text and completed tool parts carry user-facing content; other structural
 // parts (reasoning, step markers) are skipped. Tool output reuses extractToolContent
-// so exported text matches what token-utils counts.
+// so exported text matches what context-usage counts.
 function serializeMessagePart(part: MessagePart): string | null {
     if (!part || typeof part !== "object") return null
     if (part.type === "text") {
@@ -308,14 +310,6 @@ export function createDecompressTool(factoryCtx: ToolFactoryContext): V2ToolInfo
             }
             const ctx = resolveToolContext(factoryCtx, toolCtx.sessionID)
             const { rawMessages } = await prepareDecompressSession(ctx, toolCtx)
-
-            const effectiveLimitBefore = resolveEffectiveContextLimit(ctx.state, ctx.config)
-            const contextUsageBefore = effectiveLimitBefore
-                ? Math.round(
-                      (getCurrentTokenUsage(ctx.state, rawMessages) / effectiveLimitBefore.limit) *
-                          100,
-                  )
-                : undefined
 
             const resolved = resolveTargets(
                 args as Record<string, unknown>,
@@ -423,6 +417,40 @@ export function createDecompressTool(factoryCtx: ToolFactoryContext): V2ToolInfo
                 }
             }
 
+            const projection = projectDecompression(
+                ctx.state,
+                ctx.config,
+                ctx.logger,
+                rawMessages,
+                targets,
+                { full: args.full === true },
+            )
+            if (
+                projection.inputBudget !== undefined &&
+                projection.afterTokens > projection.inputBudget &&
+                projection.afterTokens > projection.beforeTokens
+            ) {
+                const displayIds = targets.map((t) => `b${t.displayId}`).join(", ")
+                ctx.logger.warn("Decompress aborted: projected context exceeds input budget", {
+                    targetDisplayIds: displayIds,
+                    full: args.full === true,
+                    ...projection,
+                })
+                return {
+                    content:
+                        `Error: Cannot decompress ${displayIds}: estimated context would grow from ` +
+                        `~${formatTokenCount(projection.beforeTokens)} to ~${formatTokenCount(projection.afterTokens)}, ` +
+                        `exceeding the ${projection.inputBudget}-token input budget ` +
+                        `(context window ${projection.contextLimit!.limit}, ${projection.contextLimit!.source}; ` +
+                        `completion reserve ${projection.completionReserve}). ` +
+                        `Block(s) stay compressed — nothing was changed. ` +
+                        `Use toFile under /tmp or ~/.cache/opencode/ and read specific sections instead.` +
+                        (args.full
+                            ? ` Omit full:true to restore only the previous tier if it fits.`
+                            : ""),
+                }
+            }
+
             const activeMessagesBefore = snapshotActiveMessages(messagesState)
             const activeBlockIdsBefore = new Set(messagesState.activeBlockIds)
 
@@ -446,14 +474,6 @@ export function createDecompressTool(factoryCtx: ToolFactoryContext): V2ToolInfo
                 ctx.state.stats.totalPruneTokens - restoredTokens,
             )
 
-            const effectiveLimitAfter = resolveEffectiveContextLimit(ctx.state, ctx.config)
-            const contextUsageAfter = effectiveLimitAfter
-                ? Math.round(
-                      (getCurrentTokenUsage(ctx.state, rawMessages) / effectiveLimitAfter.limit) *
-                          100,
-                  )
-                : undefined
-
             await finalizeDecompressSession(ctx)
 
             const restoredContentPreview = buildRestoredContentPreview(
@@ -469,8 +489,14 @@ export function createDecompressTool(factoryCtx: ToolFactoryContext): V2ToolInfo
                 `Decompressed ${headerNoun} ${displayIds}. Restored ${restoredMessageCount} message(s) (~${formatTokenCount(restoredTokens)}).`,
             )
 
-            if (contextUsageBefore !== undefined && contextUsageAfter !== undefined) {
-                lines.push(`Context usage: ${contextUsageBefore}% → ${contextUsageAfter}%.`)
+            if (projection.contextLimit) {
+                const before = Math.round(
+                    (projection.beforeTokens / projection.contextLimit.limit) * 100,
+                )
+                const after = Math.round(
+                    (projection.afterTokens / projection.contextLimit.limit) * 100,
+                )
+                lines.push(`Context usage: ${before}% → ${after}% (estimated).`)
             }
 
             if (reactivatedBlockIds.length > 0) {
