@@ -20,6 +20,7 @@
  */
 
 import { extractCompletedToolOutput } from "../context-usage"
+import { messageContainsProtectedTool } from "../compress/protected-content"
 import type { Logger } from "../logger"
 import type { SessionState, WithParts } from "../state"
 
@@ -46,7 +47,8 @@ function collectToolParts(messages: WithParts[]): ToolPartLike[] {
 
 /**
  * Replay frozen truncations onto the request copy, and prune entries whose
- * call no longer exists in the projected view.
+ * call no longer exists in the projected view. Frozen entries are kept but
+ * not replayed while their message is protected.
  *
  * [#485 review] Prune-on-vanish is intentionally coarse: a call absent from
  * ONE request's projected view (content-based filter, mid-abort partial
@@ -64,26 +66,39 @@ export function applyStickyTruncations(
     state: SessionState,
     messages: WithParts[],
     logger: Logger,
+    protectedTools: string[] = [],
+    protectedFilePatterns: string[] = [],
 ): void {
     const frozen = state.stickyTruncations
     if (Object.keys(frozen).length === 0) return
 
     let replayed = 0
     const seen = new Set<string>()
-    for (const part of collectToolParts(messages)) {
-        const callID = typeof part.callID === "string" ? part.callID : undefined
-        if (!callID) continue
-        seen.add(callID)
-        const recorded = frozen[callID]
-        if (recorded === undefined) continue
-        if (!part.state) continue // stateless part — cannot be a guard candidate
-        // [#485 review] Overwrite non-string outputs too: the guards
-        // stringify before truncating, so the frozen form is a string while
-        // the pristine per-request copy is whatever the store holds. Skipping
-        // non-strings would let the exact A→B→A flip survive for that shape.
-        if (part.state.output === recorded) continue
-        part.state.output = recorded
-        replayed++
+    for (const message of messages) {
+        const protectedMessage = messageContainsProtectedTool(
+            message,
+            protectedTools,
+            protectedFilePatterns,
+        )
+        const parts = Array.isArray(message.parts) ? message.parts : []
+        for (const part of parts as ToolPartLike[]) {
+            if (part?.type !== "tool") continue
+            const callID = typeof part.callID === "string" ? part.callID : undefined
+            if (!callID) continue
+            seen.add(callID)
+            // An old frozen output must not override a newly protected message.
+            if (protectedMessage) continue
+            const recorded = frozen[callID]
+            if (recorded === undefined) continue
+            if (!part.state) continue // stateless part — cannot be a guard candidate
+            // [#485 review] Overwrite non-string outputs too: the guards
+            // stringify before truncating, so the frozen form is a string while
+            // the pristine per-request copy is whatever the store holds. Skipping
+            // non-strings would let the exact A→B→A flip survive for that shape.
+            if (part.state.output === recorded) continue
+            part.state.output = recorded
+            replayed++
+        }
     }
 
     for (const callID of Object.keys(frozen)) {

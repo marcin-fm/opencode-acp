@@ -346,29 +346,44 @@ export function createChatMessageTransformHandler(
             // [#485 review] Resolve the switch through the provider/model
             // override cascade (same as the reasoning gate above) so
             // compress.providers.<p>.[models.<m>.]emergencyTruncation works.
-            const emergencyTruncationEnabled = applyCompressOverrides(
+            const emergencyConfig = applyCompressOverrides(
                 config,
                 dropReasoningModel?.providerID ?? state.modelProviderID,
                 dropReasoningModel?.modelID ?? state.modelID,
-            ).compress.emergencyTruncation
-            if (emergencyTruncationEnabled === true) {
+            )
+            if (emergencyConfig.compress.emergencyTruncation === true) {
+                // Match compression's effective protection without changing the
+                // other guard thresholds, which still use the global config.
+                const protectionConfig = {
+                    ...config,
+                    compress: {
+                        ...config.compress,
+                        protectedTools: emergencyConfig.compress.protectedTools,
+                    },
+                }
                 // Replay frozen truncations first, so the guards see the
                 // already-truncated form and never restore the pristine output
                 // (which is what caused the #485 cache thrash).
-                applyStickyTruncations(state, output.messages, logger)
+                applyStickyTruncations(
+                    state,
+                    output.messages,
+                    logger,
+                    emergencyConfig.compress.protectedTools,
+                    emergencyConfig.protectedFilePatterns,
+                )
                 const toolOutputsBefore = snapshotToolOutputs(output.messages)
                 // Candidate planning consumes the pre-truncation snapshot so its
                 // executor-parity check matches the fresh messages fetched by compress.
                 truncateLargeToolOutputs(
                     state,
-                    config,
+                    protectionConfig,
                     logger,
                     output.messages.filter((message) => !isSyntheticMessage(message)),
                 )
                 // Keep candidate planning independent from the final budget guard:
                 // candidates are computed from the pre-truncation snapshot so their
                 // ranges remain valid when the compress executor fetches fresh history.
-                enforceContextBudget(state, config, logger, output.messages)
+                enforceContextBudget(state, protectionConfig, logger, output.messages)
                 // Freeze whatever the guards truncated/cleared this request so it
                 // survives into the next one (and across restarts, via persistence).
                 const frozenCount = recordStickyTruncations(

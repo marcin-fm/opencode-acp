@@ -69,16 +69,16 @@ export function getFilePathsFromParameters(tool: string, parameters: unknown): s
     const paths: string[] = []
     const params = parameters as Record<string, any>
 
-    // 1. apply_patch uses patchText with embedded paths
-    if (tool === "apply_patch" && typeof params.patchText === "string") {
-        const pathRegex = /\*\*\* (?:Add|Delete|Update) File: ([^\n\r]+)/g
+    // Patch tools embed both target and move-destination paths in patchText.
+    if ((tool === "apply_patch" || tool === "patch") && typeof params.patchText === "string") {
+        const pathRegex = /\*\*\* (?:(?:Add|Delete|Update) File|Move to): ([^\n\r]+)/g
         let match
         while ((match = pathRegex.exec(params.patchText)) !== null) {
             paths.push(match[1].trim())
         }
     }
 
-    // 2. multiedit uses top-level filePath and nested edits array
+    // multiedit uses top-level filePath and nested edits array
     if (tool === "multiedit") {
         if (typeof params.filePath === "string") {
             paths.push(params.filePath)
@@ -92,9 +92,12 @@ export function getFilePathsFromParameters(tool: string, parameters: unknown): s
         }
     }
 
-    // 3. Default check for common filePath parameter (read, write, edit, etc)
+    // File tools use filePath in V1 and path in V2.
     if (typeof params.filePath === "string") {
         paths.push(params.filePath)
+    }
+    if (typeof params.path === "string") {
+        paths.push(params.path)
     }
 
     // Return unique non-empty paths
