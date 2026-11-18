@@ -18,7 +18,6 @@ import {
 import { createModelLimitCatalog } from "./model-limits"
 import { rebuildCompressionState, restoreForkCompressionState } from "./rebuild"
 import {
-    getSessionParentId,
     findLastCompactionTimestamp,
     countTurns,
     resetOnCompaction,
@@ -27,7 +26,7 @@ import {
     collectTurnNudgeAnchors,
 } from "./utils"
 import { parseMessageRef, formatMessageRef } from "../message-ids"
-import { fetchV2SessionMessages } from "../v2/messages"
+import { fetchV2ForkSourceMessages, getV2SessionLineage } from "../v2/session"
 
 /**
  * Per-turn state update (compaction detection + turn count). Extracted from the
@@ -326,9 +325,8 @@ export async function ensureSessionInitialized(
         ? resolveStorageDir(config.storagePath, projectDir ?? cwd())
         : undefined
 
-    const parentSessionId = await getSessionParentId(client, sessionId)
-    const isChildSession = parentSessionId !== undefined
-    state.isSubAgent = isChildSession
+    const { parentID, fork } = await getV2SessionLineage(client, sessionId)
+    state.isSubAgent = parentID !== undefined
 
     state.lastCompaction = findLastCompactionTimestamp(messages)
     state.currentTurn = countTurns(state, messages)
@@ -336,11 +334,6 @@ export async function ensureSessionInitialized(
 
     const persisted = await loadSessionState(sessionId, logger, state.storageDir)
     if (persisted === null) {
-        // Fork recovery: a fork gets new raw IDs and may omit historical
-        // compress inputs. Prefer translating the parent state; replay remains
-        // the cross-machine and legacy fallback.
-        // The parent state transfer below is preferred for forks; replay remains
-        // the cross-machine and legacy fallback.
         // storagePath points elsewhere but the session file still sits at the
         // default location (e.g. the user just configured storagePath). No
         // auto-migration — warn once (this init path runs once per session).
@@ -351,48 +344,36 @@ export async function ensureSessionInitialized(
                 { sessionId, storageDir: state.storageDir, defaultPath },
             )
         }
-        // Fork recovery: no persisted state for this session. If config is
-        // available, replay historical compress tool invocations to rebuild
-        // pruning state using the current session's message IDs.
+        // Only a V2 fork copies history. A subagent may inherit truncate
+        // snapshots, but its parent is not a source of message aliases.
         if (config) {
             let restored = 0
-            if (parentSessionId) {
+            const sourceSessionId = fork?.sessionID ?? parentID
+            if (sourceSessionId) {
                 try {
-                    const parent = await loadSessionState(parentSessionId, logger)
-                    // [#485 review] Forks/subagents inherit the parent's frozen
-                    // truncations so the wire view stays stable across the fork
-                    // point (this branch returns before the regular sticky
-                    // restore below, which only runs for persisted sessions).
-                    if (parent?.stickyTruncations) {
-                        for (const [callID, output] of Object.entries(parent.stickyTruncations)) {
+                    const source = await loadSessionState(sourceSessionId, logger, state.storageDir)
+                    if (source?.stickyTruncations) {
+                        for (const [callID, output] of Object.entries(source.stickyTruncations)) {
                             if (typeof output === "string") {
                                 state.stickyTruncations[callID] = output
                             }
                         }
                     }
-                    const parentMessages = parent
-                        ? await fetchV2SessionMessages(client, parentSessionId)
-                        : []
-                    if (parent && parentMessages.length > 0) {
-                        // Standard subagents skip their first user prompt when
-                        // assigning refs. A copied fork needs that prompt to
-                        // match the parent state, but only for this transfer.
-                        state.isSubAgent = false
-                        try {
+                    if (source && fork) {
+                        const sourceMessages = await fetchV2ForkSourceMessages(client, fork)
+                        if (sourceMessages.length > 0) {
                             restored = restoreForkCompressionState(
                                 state,
                                 messages,
-                                parent,
-                                parentMessages,
+                                source,
+                                sourceMessages,
                                 logger,
                             )
-                        } finally {
-                            state.isSubAgent = isChildSession
                         }
                     }
                 } catch (error: any) {
                     logger.warn("fork: parent state transfer unavailable, replaying history", {
-                        parentSessionId,
+                        sourceSessionId,
                         error: error?.message,
                     })
                 }
@@ -404,11 +385,9 @@ export async function ensureSessionInitialized(
                 await saveSessionState(state, logger)
             }
         }
-        state.isSubAgent = isChildSession
         return
     }
 
-    state.isSubAgent = isChildSession
     state.prune.messages = loadPruneMessagesState(persisted.prune.messages)
     state.nudges.contextLimitAnchors = new Set<string>(persisted.nudges.contextLimitAnchors || [])
     state.nudges.turnNudgeAnchors = new Set<string>([

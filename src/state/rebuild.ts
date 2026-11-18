@@ -1,16 +1,12 @@
 /**
  * Fork-recovery: reconstruct ACP compression state from message history.
  *
- * When a session is forked, OpenCode copies all messages (including completed
- * `compress` tool parts) but regenerates message IDs. ACP's persisted state is
- * keyed off the original session ID and original raw message IDs, so the fork
- * session starts with empty prune state → no pruning → context overflow.
+ * OpenCode forks copy a durable prefix with new message IDs. When the source
+ * state is available, transfer its exact aliases and eligible blocks.
  *
- * This module replays historical `compress` tool invocations in chronological
- * order, rebuilding `CompressionBlock`s / `byMessageId` / `activeByAnchorMessageId`
- * using the fork's NEW raw IDs. Legacy refs (mNNNNN) are fork-stable when
- * assigned in nonhost transcript order. Host-aware refs may instead have been
- * backfilled; those invocations require existing aliases when hosts are present.
+ * Without source state, replay historical `acp_compress` invocations in
+ * chronological order. Legacy refs can be assigned in nonhost transcript
+ * order; host-aware calls require known aliases when deliveries are present.
  *
  * The rebuilt state is an approximation: protected-content enrichments that
  * were appended to summaries at original-compress-time are not re-derived
@@ -22,6 +18,7 @@ import type { GCConfig, PluginConfig } from "../config"
 import type { Logger } from "../logger"
 import { assignMessageRefs, parseMessageRef } from "../message-ids"
 import { isHostInput } from "../messages/query"
+import { syncCompressionBlocks } from "../messages/sync"
 import {
     buildSearchContext,
     resolveAnchorMessageId,
@@ -146,7 +143,7 @@ function fingerprintMessage(message: WithParts): string {
         return { type: part.type }
     })
     return createHash("sha256")
-        .update(JSON.stringify({ role: message.info.role, parts }))
+        .update(JSON.stringify({ role: message.info.role, hostInput: isHostInput(message), parts }))
         .digest("hex")
 }
 
@@ -161,22 +158,15 @@ function mapForkIds(
     parentMessages: WithParts[],
     forkMessages: WithParts[],
 ): ForkIdMap | null {
-    const parentRefs = parent.messageIds?.byRef
-    if (!parentRefs) return null
+    const parentAliases = parent.messageIds
+    if (!parentAliases) return null
 
-    const parentById = new Map(parentMessages.map((message) => [message.info.id, message]))
-    const forkById = new Map(forkMessages.map((message) => [message.info.id, message]))
     const messages = new Map<string, string>()
     const tools = new Map<string, string>()
+    let hasSavedHostAliases = false
 
-    for (const [ref, parentId] of Object.entries(parentRefs)) {
-        const forkId = state.messageIds.byRef.get(ref)
-        if (!forkId) continue
-        const parentMessage = parentById.get(parentId)
-        const forkMessage = forkById.get(forkId)
-        if (!parentMessage || !forkMessage) continue
-        if (fingerprintMessage(parentMessage) !== fingerprintMessage(forkMessage)) continue
-        messages.set(parentId, forkId)
+    function recordMatch(parentMessage: WithParts, forkMessage: WithParts): void {
+        messages.set(parentMessage.info.id, forkMessage.info.id)
         for (let index = 0; index < parentMessage.parts.length; index++) {
             const parentPart = parentMessage.parts[index]
             const forkPart = forkMessage.parts[index]
@@ -192,6 +182,50 @@ function mapForkIds(
         }
     }
 
+    // A fork changes raw IDs but copies the transcript in order. Reuse only
+    // exact saved aliases in the verified prefix. Old source state has no
+    // aliases for handoffs; a backfilled delivery may have a much newer ref.
+    for (const [index, parentMessage] of parentMessages.entries()) {
+        const forkMessage = forkMessages[index]
+        if (!forkMessage || fingerprintMessage(parentMessage) !== fingerprintMessage(forkMessage)) {
+            return null
+        }
+        const parentId = parentMessage.info.id
+        const forkId = forkMessage.info.id
+        const ref = parentAliases.byRawId[parentId]
+        if (!ref) continue
+        if (
+            parentAliases.byRef[ref] !== parentId ||
+            (state.messageIds.byRawId.has(forkId) &&
+                state.messageIds.byRawId.get(forkId) !== ref) ||
+            (state.messageIds.byRef.has(ref) && state.messageIds.byRef.get(ref) !== forkId)
+        ) {
+            return null
+        }
+        state.messageIds.byRawId.set(forkId, ref)
+        state.messageIds.byRef.set(ref, forkId)
+        hasSavedHostAliases ||= isHostInput(parentMessage)
+        recordMatch(parentMessage, forkMessage)
+    }
+
+    // Preserve the legacy ref epoch: new hosts come after issued source
+    // aliases, even if a recovery pass had previously advanced nextRef.
+    if (hasSavedHostAliases) {
+        state.messageIds.nextRef = Math.max(state.messageIds.nextRef, parentAliases.nextRef)
+    } else {
+        for (const ref of Object.keys(parentAliases.byRef)) {
+            const index = parseMessageRef(ref)
+            if (index !== null)
+                state.messageIds.nextRef = Math.max(state.messageIds.nextRef, index + 1)
+        }
+        assignMessageRefs(
+            state,
+            forkMessages.filter((message) => !isHostInput(message)),
+        )
+    }
+    assignMessageRefs(state, forkMessages)
+    state.messageIds.nextRef = Math.max(state.messageIds.nextRef, parentAliases.nextRef)
+
     return { messages, tools }
 }
 
@@ -201,10 +235,8 @@ function translateIds(ids: string[], mapped: Map<string, string>): string[] | nu
 }
 
 /**
- * Restore pre-fork compression blocks from the parent state when the fork's
- * copied history no longer includes replayable compress inputs. This is
- * intentionally all-or-nothing for active blocks: an uncertain mapping falls
- * back to normal history replay instead of risking an incorrect prune.
+ * Restore source compression blocks for invocations inside the copied prefix.
+ * Never import post-fork blocks or a block whose coverage cannot be mapped.
  */
 export function restoreForkCompressionState(
     state: SessionState,
@@ -215,37 +247,25 @@ export function restoreForkCompressionState(
 ): number {
     if (!parent.prune.messages || !parent.messageIds) return 0
 
-    // A host-aware parent's alias chronology cannot be inferred from a fork:
-    // hosts may have been backfilled after older aliases were already issued.
-    // Without fork aliases, leave the raw history intact instead of guessing.
-    if (
-        state.messageIds.byRawId.size === 0 &&
-        parentMessages.some(
-            (message) => isHostInput(message) && parent.messageIds?.byRawId[message.info.id],
-        )
-    ) {
-        return 0
+    const forkAliases: typeof state.messageIds = {
+        byRawId: new Map(state.messageIds.byRawId),
+        byRef: new Map(state.messageIds.byRef),
+        nextRef: state.messageIds.nextRef,
     }
-
-    const forkState = {
-        ...state,
-        messageIds: {
-            ...state.messageIds,
-            byRawId: new Map(state.messageIds.byRawId),
-            byRef: new Map(state.messageIds.byRef),
-        },
-    }
-    assignMessageRefs(
-        forkState,
-        forkMessages.filter((message) => !isHostInput(message)),
+    const mapped = mapForkIds(
+        { ...state, messageIds: forkAliases },
+        parent,
+        parentMessages,
+        forkMessages,
     )
-    assignMessageRefs(forkState, forkMessages)
-    const mapped = mapForkIds(forkState, parent, parentMessages, forkMessages)
     if (!mapped) return 0
 
+    const sourceMessageIds = new Set(parentMessages.map((message) => message.info.id))
     const parentBlocks = Object.values(parent.prune.messages.blocksById)
+    const activeParentIds = new Set(parent.prune.messages.activeBlockIds)
     const translatedBlocks = new Map<number, (typeof parentBlocks)[number]>()
     for (const block of parentBlocks) {
+        if (!sourceMessageIds.has(block.compressMessageId)) continue
         const anchorMessageId = mapped.messages.get(block.anchorMessageId)
         const compressMessageId = mapped.messages.get(block.compressMessageId)
         const directMessageIds = translateIds(block.directMessageIds, mapped.messages)
@@ -264,6 +284,7 @@ export function restoreForkCompressionState(
             !effectiveToolIds ||
             (block.compressCallId && !compressCallId)
         ) {
+            if (activeParentIds.has(block.blockId)) return 0
             continue
         }
         translatedBlocks.set(block.blockId, {
@@ -278,33 +299,31 @@ export function restoreForkCompressionState(
         })
     }
 
-    const activeParentIds = new Set(parent.prune.messages.activeBlockIds)
-    if (
-        activeParentIds.size === 0 ||
-        Array.from(activeParentIds).some((blockId) => !translatedBlocks.has(blockId))
-    ) {
-        return 0
-    }
+    if (translatedBlocks.size === 0) return 0
 
     const copiedBlockIds = new Set(translatedBlocks.keys())
     for (const block of translatedBlocks.values()) {
         if (
-            block.active &&
             [...block.consumedBlockIds, ...block.includedBlockIds].some(
                 (blockId) => !copiedBlockIds.has(blockId),
             )
         ) {
             return 0
         }
+        block.parentBlockIds = (block.parentBlockIds ?? []).filter((blockId) =>
+            copiedBlockIds.has(blockId),
+        )
+        if (
+            block.deactivatedByBlockId !== undefined &&
+            !copiedBlockIds.has(block.deactivatedByBlockId)
+        ) {
+            block.deactivatedByBlockId = undefined
+        }
     }
 
     const messagesState = createPruneMessagesState()
     for (const block of translatedBlocks.values()) {
         messagesState.blocksById.set(block.blockId, block)
-        if (block.active) {
-            messagesState.activeBlockIds.add(block.blockId)
-            messagesState.activeByAnchorMessageId.set(block.anchorMessageId, block.blockId)
-        }
     }
     for (const [parentMessageId, entry] of Object.entries(parent.prune.messages.byMessageId)) {
         const forkMessageId = mapped.messages.get(parentMessageId)
@@ -314,16 +333,22 @@ export function restoreForkCompressionState(
         messagesState.byMessageId.set(forkMessageId, {
             tokenCount: entry.tokenCount,
             allBlockIds,
-            activeBlockIds: allBlockIds.filter((blockId) =>
-                messagesState.activeBlockIds.has(blockId),
-            ),
+            activeBlockIds: [],
         })
     }
-    messagesState.nextBlockId = Math.max(parent.prune.messages.nextBlockId, ...copiedBlockIds) + 1
+    messagesState.nextBlockId = Math.max(
+        parent.prune.messages.nextBlockId,
+        Math.max(...copiedBlockIds) + 1,
+    )
     messagesState.nextRunId = parent.prune.messages.nextRunId
-    messagesState.membershipsVerified = true
+    // The source may have consumed a copied block in a later, uncopied call.
+    syncCompressionBlocks(
+        { ...state, prune: { ...state.prune, messages: messagesState } },
+        logger,
+        forkMessages,
+    )
+    state.messageIds = forkAliases
     state.prune.messages = messagesState
-    state.messageIds = forkState.messageIds
 
     logger.info("fork: restored compression state from parent", {
         blocks: copiedBlockIds.size,

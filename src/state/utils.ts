@@ -69,22 +69,6 @@ export function serializePruneMessagesState(
     }
 }
 
-export async function getSessionParentId(
-    client: any,
-    sessionID: string,
-): Promise<string | undefined> {
-    try {
-        const result = await client.session.get({ sessionID })
-        return typeof result?.parentID === "string" ? result.parentID : undefined
-    } catch (error: any) {
-        return undefined
-    }
-}
-
-export async function isSubAgentSession(client: any, sessionID: string): Promise<boolean> {
-    return (await getSessionParentId(client, sessionID)) !== undefined
-}
-
 export function findLastCompactionTimestamp(messages: WithParts[]): number {
     for (let i = messages.length - 1; i >= 0; i--) {
         const msg = messages[i]
