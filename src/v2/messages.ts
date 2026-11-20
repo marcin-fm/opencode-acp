@@ -145,10 +145,11 @@ type V2RequestInput = {
     metadata?: Record<string, unknown>
 }
 
-/** ACP notifications are UI output, not fresh model input. */
-function isAcpNotification(message: V2Message): boolean {
+/** Display notices are not agent deliveries. */
+function isDisplayNotification(message: V2Message): boolean {
     return (
         message.metadata?.source === "opencode-acp" ||
+        message.metadata?.source === "shell" ||
         (message.metadata?.source === undefined &&
             (message.description === "ACP" ||
                 message.description === "ACP update ready" ||
@@ -181,7 +182,7 @@ export function fromV2SessionMessages(
         if (!hostInput && message.type !== "user" && message.type !== "assistant") continue
         if (typeof message.id !== "string") continue
         const requestInput = requestInputs.get(message.id)
-        if (hostInput && (isAcpNotification(message) || (requestMessages && !requestInput)))
+        if (hostInput && (isDisplayNotification(message) || (requestMessages && !requestInput)))
             continue
 
         const role = hostInput ? "user" : message.type

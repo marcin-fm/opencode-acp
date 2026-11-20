@@ -1,19 +1,19 @@
 import type { WithParts } from "../state"
-import { getLastUserMessage } from "./query"
+import { getLastUserMessage, getRequestInput } from "./query"
 
 /**
  * Mirrors opencode's differentModel handling by preserving part content while
  * dropping provider metadata on assistant parts that came from a different
- * model/provider than the current turn's user message.
+ * model/provider than the current request input.
  */
 export function stripStaleMetadata(messages: WithParts[]): void {
-    const lastUserMessage = getLastUserMessage(messages)
-    if (lastUserMessage?.info.role !== "user") {
+    const requestInput = getRequestInput(messages)
+    if (requestInput?.info.role !== "user") {
         return
     }
 
-    const modelID = lastUserMessage.info.model.modelID
-    const providerID = lastUserMessage.info.model.providerID
+    const modelID = requestInput.info.model.modelID
+    const providerID = requestInput.info.model.providerID
 
     messages.forEach((message) => {
         if (message.info.role !== "assistant") {
