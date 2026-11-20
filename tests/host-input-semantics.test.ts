@@ -7,6 +7,7 @@ import {
     filterLastUserMessage,
 } from "../src/compress/protected-content"
 import { buildSearchContext } from "../src/compress/search"
+import { syncCompressPermissionState } from "../src/compress-permission"
 import type { PluginConfig } from "../src/config"
 import { Logger } from "../src/logger"
 import { prune } from "../src/messages/prune"
@@ -20,6 +21,7 @@ import {
     isUserPrompt,
 } from "../src/messages/query"
 import { createSyntheticUserMessage } from "../src/messages/utils"
+import { stripStaleMetadata } from "../src/messages/reasoning-strip"
 import { createSessionState, type WithParts } from "../src/state"
 import { collectTurnNudgeAnchors } from "../src/state/utils"
 
@@ -88,6 +90,27 @@ test("host deliveries do not create human turn nudge anchors", () => {
         collectTurnNudgeAnchors([first, human, second, host]),
         new Set(["first", "human"]),
     )
+})
+
+test("handoff-only requests respect agent permissions and strip stale model metadata", () => {
+    const state = createSessionState()
+    const host = user("host", true)
+    const previous = assistant("previous")
+    assert.equal(previous.info.role, "assistant")
+    previous.info.modelID = "old-model"
+    previous.parts[0].metadata = { provider: "old" }
+    const messages = [previous, host]
+
+    syncCompressPermissionState(
+        state,
+        { compress: { permission: "allow" } } as PluginConfig,
+        { global: undefined, agents: { code: { acp_compress: "deny" } } },
+        messages,
+    )
+    assert.equal(state.compressPermission, "deny")
+
+    stripStaleMetadata(messages)
+    assert.deepEqual(previous.parts, [{ type: "text", text: "previous" }])
 })
 
 test("protected user and prompt enrichment preserves only human content", () => {

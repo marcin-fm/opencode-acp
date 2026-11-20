@@ -49,7 +49,7 @@ test("an empty request window excludes durable deliveries, while history reads i
     assert.equal(fromV2SessionMessages(history, "session").length, 1)
 })
 
-test("ACP notifications are excluded without excluding deliveries from other sources", () => {
+test("ACP and shell notices are excluded without excluding peer deliveries", () => {
     const history = [
         {
             id: "new-notice",
@@ -78,9 +78,24 @@ test("ACP notifications are excluded without excluding deliveries from other sou
             description: "ACP",
         },
         { id: "legacy", type: "synthetic", text: "LEGACY_RESULT" },
+        {
+            id: "shell",
+            type: "synthetic",
+            text: "COMMAND_COMPLETED",
+            metadata: { source: "shell" },
+        },
     ]
     assert.deepEqual(
         fromV2SessionMessages(history, "session").map((message) => message.info.id),
+        ["peer", "legacy"],
+    )
+    const request = history.map((row) => ({
+        id: row.id,
+        role: "user",
+        content: [{ type: "text", text: row.text }],
+    }))
+    assert.deepEqual(
+        fromV2SessionMessages(history, "session", request).map((message) => message.info.id),
         ["peer", "legacy"],
     )
 })
