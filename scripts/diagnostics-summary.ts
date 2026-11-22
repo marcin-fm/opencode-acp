@@ -4,6 +4,7 @@ import { createReadStream } from "node:fs"
 import { resolve } from "node:path"
 import { createInterface } from "node:readline"
 import { pathToFileURL } from "node:url"
+import type { TokenCacheDiagnostic } from "../src/diagnostics"
 
 const TOKEN_KEYS = [
     "usageCalls",
@@ -21,6 +22,16 @@ const CACHE_KEYS = ["cacheHits", "cacheMisses", "cacheEvictions"] as const
 
 type TokenCounters = Record<(typeof TOKEN_KEYS)[number], number>
 type CacheCounters = Record<(typeof CACHE_KEYS)[number], number>
+const CACHE_DETAIL_KEYS = [
+    "hits",
+    "misses",
+    "evictions",
+    "failures",
+    "inputChars",
+    "missChars",
+    "countMs",
+] as const
+type CacheDetails = Pick<TokenCacheDiagnostic, (typeof CACHE_DETAIL_KEYS)[number]>
 type Lane = "context" | "transform"
 
 export interface ContextDiagnosticRecord {
@@ -36,6 +47,7 @@ export interface ContextDiagnosticRecord {
     counts: Record<string, number>
     stageMs: Partial<Record<Lane, Record<string, number>>>
     tokens?: TokenCounters & Partial<CacheCounters>
+    tokenCache?: TokenCacheDiagnostic
     version: string
 }
 
@@ -109,6 +121,21 @@ export function parseDiagnosticLine(line: string): DiagnosticLineResult {
             return { kind: "malformed" }
         }
     }
+    if (payload.tokenCache !== undefined) {
+        const cache = payload.tokenCache
+        if (
+            !isObject(cache) ||
+            ![...CACHE_DETAIL_KEYS, "capacity", "entries"].every((key) =>
+                isNonnegativeNumber(cache[key]),
+            ) ||
+            !Number.isInteger(cache.capacity) ||
+            !Number.isInteger(cache.entries) ||
+            (cache.capacity as number) <= 0 ||
+            (cache.entries as number) > (cache.capacity as number)
+        ) {
+            return { kind: "malformed" }
+        }
+    }
     return { kind: "diagnostic", record: payload as unknown as ContextDiagnosticRecord }
 }
 
@@ -146,6 +173,13 @@ export class DiagnosticsAggregator {
     ) as CacheCounters
     private measuredTokenRecords = 0
     private measuredCacheRecords = 0
+    private readonly cacheDetailTotals = Object.fromEntries(
+        CACHE_DETAIL_KEYS.map((key) => [key, 0]),
+    ) as CacheDetails
+    private readonly cacheCapacities = new Set<number>()
+    private measuredCacheDetailRecords = 0
+    private maxCacheEntries = 0
+    private atCapacityRecords = 0
     private malformedLines = 0
     private ignoredLines = 0
     private duplicateRecords = 0
@@ -198,6 +232,14 @@ export class DiagnosticsAggregator {
                 for (const key of CACHE_KEYS) this.cacheTotals[key] += record.tokens[key]!
             }
         }
+        if (record.tokenCache !== undefined) {
+            const cache = record.tokenCache
+            this.measuredCacheDetailRecords++
+            for (const key of CACHE_DETAIL_KEYS) this.cacheDetailTotals[key] += cache[key]
+            this.cacheCapacities.add(cache.capacity)
+            this.maxCacheEntries = Math.max(this.maxCacheEntries, cache.entries)
+            if (cache.entries === cache.capacity) this.atCapacityRecords++
+        }
     }
 
     summary() {
@@ -232,6 +274,19 @@ export class DiagnosticsAggregator {
                     unavailableRecords: this.durations.length - this.measuredCacheRecords,
                     totals: this.measuredCacheRecords ? { ...this.cacheTotals } : null,
                 },
+            },
+            tokenCache: {
+                measuredRecords: this.measuredCacheDetailRecords,
+                unavailableRecords: this.durations.length - this.measuredCacheDetailRecords,
+                totals: this.measuredCacheDetailRecords ? { ...this.cacheDetailTotals } : null,
+                hitRatio:
+                    this.cacheDetailTotals.hits + this.cacheDetailTotals.misses > 0
+                        ? this.cacheDetailTotals.hits /
+                          (this.cacheDetailTotals.hits + this.cacheDetailTotals.misses)
+                        : null,
+                capacities: [...this.cacheCapacities].sort((a, b) => a - b),
+                maxEntries: this.measuredCacheDetailRecords ? this.maxCacheEntries : null,
+                atCapacityRecords: this.atCapacityRecords,
             },
             versions: Object.fromEntries(this.versions),
             malformedDiagnosticLines: this.malformedLines,

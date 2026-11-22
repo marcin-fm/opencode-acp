@@ -135,6 +135,50 @@ test("optional token measurements are aggregated only when present and complete"
     })
 })
 
+test("extended cache measurements stay separate from upstream cache counters", () => {
+    const cache = {
+        hits: 3,
+        misses: 1,
+        evictions: 1,
+        failures: 0,
+        inputChars: 80,
+        missChars: 20,
+        countMs: 2.5,
+        capacity: 65536,
+        entries: 65536,
+    }
+    const result = summarizeDiagnostics([
+        line(record({ tokenCache: cache })),
+        line(
+            record({
+                traceId: "other",
+                tokenCache: { ...cache, capacity: 32768, entries: 12 },
+            }),
+        ),
+        line(record({ traceId: "old" })),
+        line(record({ traceId: "invalid", tokenCache: { ...cache, entries: 65537 } })),
+    ])
+    assert.equal(result.malformedDiagnosticLines, 1)
+    assert.equal(result.tokenWorkload.cache.measuredRecords, 0)
+    assert.deepEqual(result.tokenCache, {
+        measuredRecords: 2,
+        unavailableRecords: 1,
+        totals: {
+            hits: 6,
+            misses: 2,
+            evictions: 2,
+            failures: 0,
+            inputChars: 160,
+            missChars: 40,
+            countMs: 5,
+        },
+        hitRatio: 0.75,
+        capacities: [32768, 65536],
+        maxEntries: 65536,
+        atCapacityRecords: 1,
+    })
+})
+
 test("summary CLI is read-only, supports session filtering and rejects missing files", async () => {
     const sandbox = await mkdtemp(join(tmpdir(), "acp-summary-test-"))
     try {

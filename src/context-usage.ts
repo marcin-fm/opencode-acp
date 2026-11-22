@@ -168,8 +168,10 @@ export function getCurrentParams(
 
 export function countTokens(text: string): number {
     if (!text) return 0
-    const counters = currentDiagnostic()?.tokens
+    const diagnostic = currentDiagnostic()
+    const counters = diagnostic?.tokens
     const startedAt = counters ? performance.now() : 0
+    let hit = false
     if (counters) {
         counters.tokenizerCalls++
         counters.tokenizerChars += text.length
@@ -180,6 +182,7 @@ export function countTokens(text: string): number {
         const key = createHash("sha256").update(text, "utf16le").digest("hex")
         const cached = tokenCounts.get(key)
         if (cached !== undefined) {
+            hit = true
             tokenCounts.delete(key)
             tokenCounts.set(key, cached)
             if (counters) counters.cacheHits++
@@ -205,7 +208,16 @@ export function countTokens(text: string): number {
         tokenizer = undefined
         return Math.round(text.length / 4)
     } finally {
-        if (counters) counters.tokenizerMs += performance.now() - startedAt
+        if (diagnostic && counters) {
+            counters.tokenizerMs += performance.now() - startedAt
+            const details = (diagnostic.tokenCacheDetails ??= {
+                missChars: 0,
+                capacity: TOKEN_COUNT_CACHE_LIMIT,
+                entries: 0,
+            })
+            if (!hit) details.missChars += text.length
+            details.entries = tokenCounts.size
+        }
     }
 }
 

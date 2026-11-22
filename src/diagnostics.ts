@@ -43,6 +43,18 @@ class StageTimeline {
     }
 }
 
+export interface TokenCacheDiagnostic {
+    hits: number
+    misses: number
+    evictions: number
+    failures: number
+    inputChars: number
+    missChars: number
+    countMs: number
+    capacity: number
+    entries: number
+}
+
 export class ContextDiagnostic {
     readonly traceId = `${instanceId}-${++sequence}`
     readonly startedAt = performance.now()
@@ -66,6 +78,7 @@ export class ContextDiagnostic {
         cacheMisses: 0,
         cacheEvictions: 0,
     }
+    tokenCacheDetails?: { missChars: number; capacity: number; entries: number }
     private readonly lanes = new Map<string, StageTimeline>()
     private status: "ok" | "skipped" | "error" = "ok"
     private skipReason?: string
@@ -127,6 +140,17 @@ export class ContextDiagnostic {
                             ...this.tokens,
                             tokenizerMs: milliseconds(this.tokens.tokenizerMs),
                         },
+                        tokenCache: this.tokenCacheDetails
+                            ? {
+                                  hits: this.tokens.cacheHits,
+                                  misses: this.tokens.tokenizerCalls - this.tokens.cacheHits,
+                                  evictions: this.tokens.cacheEvictions,
+                                  failures: this.tokens.tokenizerErrors,
+                                  inputChars: this.tokens.tokenizerChars,
+                                  countMs: milliseconds(this.tokens.tokenizerMs),
+                                  ...this.tokenCacheDetails,
+                              }
+                            : undefined,
                         stageMs: Object.fromEntries(
                             [...this.lanes].map(([name, lane]) => [name, lane.snapshot()]),
                         ),

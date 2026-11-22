@@ -61,6 +61,8 @@ Completion logging is best effort: process crashes, hard hangs, or write failure
 
 ### Offline summary
 
+Local builds also retain the optional `tokenCache` record for compatibility with historical logs. It reports upstream's request counters alongside missed input characters and the shared cache's capacity and occupancy at the last nonempty count. The offline `tokenCache` summary accepts both older local records and new records, without mixing them into upstream's `tokenWorkload.cache` totals. A full cache alone is not evidence of thrashing.
+
 Summarize ACP daily logs offline from the repository root:
 
 ```bash
