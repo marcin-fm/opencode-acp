@@ -124,6 +124,7 @@ export function validateNonOverlapping(plans: ResolvedRangeCompression[]): void 
 export interface ExecutableRangePlansResult {
     plans: ResolvedRangeCompression[]
     totalChars: number
+    protectedMessageIds: string[]
 }
 
 /**
@@ -148,7 +149,7 @@ export function prepareExecutableRangePlans(
     const resolvedPlans = resolveRanges(normalizedArgs, searchContext, state, logger, options)
     validateNonOverlapping(resolvedPlans)
 
-    const plans = resolvedPlans
+    const filteredPlans = resolvedPlans
         .map((plan) => ({
             ...plan,
             selection: filterProtectedToolMessages(
@@ -176,11 +177,24 @@ export function prepareExecutableRangePlans(
                           config.compress,
                       ),
         }))
-        .filter((plan) => plan.selection.messageIds.length > 0)
+    const protectedMessageIds = [
+        ...new Set(
+            resolvedPlans.flatMap((plan, index) => {
+                const selected = new Set(filteredPlans[index]!.selection.messageIds)
+                return plan.selection.messageIds.filter((id) => !selected.has(id))
+            }),
+        ),
+    ]
+    const plans = filteredPlans.filter((plan) => plan.selection.messageIds.length > 0)
 
     if (plans.length === 0) {
+        const protectedRefs = protectedMessageIds
+            .slice(0, 12)
+            .map((id) => state.messageIds.byRawId.get(id) ?? id)
+            .join(", ")
         throw new Error(
-            "All selected messages were filtered out (protected tool outputs and/or the last user message). They must remain in visible context.",
+            "All selected messages were filtered out by protected tool/file, last-user, or recent-message protection. " +
+                `They remain in visible context (${protectedRefs}${protectedMessageIds.length > 12 ? ", …" : ""}).`,
         )
     }
 
@@ -201,7 +215,7 @@ export function prepareExecutableRangePlans(
         )
     }
 
-    return { plans, totalChars }
+    return { plans, totalChars, protectedMessageIds }
 }
 
 export function parseBlockPlaceholders(summary: string): ParsedBlockPlaceholder[] {
