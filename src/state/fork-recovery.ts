@@ -136,6 +136,7 @@ export async function prepareForkRecovery(
         source,
         sourceMessages,
         logger,
+        true,
     )
     if (restored === 0)
         throw new Error("Source blocks cannot be mapped completely within the fork boundary.")

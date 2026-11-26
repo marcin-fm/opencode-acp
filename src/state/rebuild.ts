@@ -155,6 +155,36 @@ interface ForkIdMap {
     tools: Map<string, string>
 }
 
+// Native fork provenance gives us an ordered copy, independently of when the
+// source assigned its aliases. Verify the copy before seeding the probe maps.
+function seedVerifiedForkRefs(
+    state: SessionState,
+    parentRefs: NonNullable<PersistedSessionState["messageIds"]>,
+    parentMessages: WithParts[],
+    forkMessages: WithParts[],
+): boolean {
+    if (parentMessages.length > forkMessages.length) return false
+    for (const [index, source] of parentMessages.entries()) {
+        const target = forkMessages[index]
+        if (fingerprintMessage(source) !== fingerprintMessage(target)) return false
+        const ref = parentRefs.byRawId[source.info.id]
+        if (!ref) continue
+        const refIndex = parseMessageRef(ref)
+        if (refIndex === null || parentRefs.byRef[ref] !== source.info.id) return false
+        const raw = target.info.id
+        const existingRef = state.messageIds.byRawId.get(raw)
+        const existingRaw = state.messageIds.byRef.get(ref)
+        if ((existingRef && existingRef !== ref) || (existingRaw && existingRaw !== raw)) {
+            return false
+        }
+        state.messageIds.byRawId.set(raw, ref)
+        state.messageIds.byRef.set(ref, raw)
+        state.messageIds.nextRef = Math.max(state.messageIds.nextRef, refIndex + 1)
+    }
+    state.messageIds.nextRef = Math.max(state.messageIds.nextRef, parentRefs.nextRef)
+    return true
+}
+
 function mapForkIds(
     state: SessionState,
     parent: PersistedSessionState,
@@ -221,6 +251,7 @@ export function restoreForkCompressionState(
     parent: PersistedSessionState,
     parentMessages: WithParts[],
     logger: Logger,
+    verifiedForkProvenance = false,
 ): number {
     if (!parent.prune.messages || !parent.messageIds) return 0
 
@@ -228,6 +259,7 @@ export function restoreForkCompressionState(
     // hosts may have been backfilled after older aliases were already issued.
     // Without fork aliases, leave the raw history intact instead of guessing.
     if (
+        !verifiedForkProvenance &&
         state.messageIds.byRawId.size === 0 &&
         parentMessages.some(
             (message) => isHostInput(message) && parent.messageIds?.byRawId[message.info.id],
@@ -243,6 +275,12 @@ export function restoreForkCompressionState(
             byRawId: new Map(state.messageIds.byRawId),
             byRef: new Map(state.messageIds.byRef),
         },
+    }
+    if (
+        verifiedForkProvenance &&
+        !seedVerifiedForkRefs(forkState, parent.messageIds, parentMessages, forkMessages)
+    ) {
+        return 0
     }
     assignMessageRefs(
         forkState,

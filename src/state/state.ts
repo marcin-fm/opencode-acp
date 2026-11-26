@@ -414,6 +414,7 @@ export async function ensureSessionInitialized(
                                 parent,
                                 parentMessages,
                                 logger,
+                                Boolean(relations.fork),
                             )
                         } finally {
                             state.isSubAgent = isChildSession

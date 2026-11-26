@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { getConfig } from "../src/config"
 import { Logger } from "../src/logger"
+import { assignMessageRefs } from "../src/message-ids"
 import { createSessionState, ensureSessionInitialized } from "../src/state"
 import {
     configureNativeStateStorage,
@@ -152,6 +153,36 @@ for (const customStorage of [false, true]) {
             1,
         )
         if (customStorage) assert.deepEqual(f.nativeReads, [])
+    })
+}
+
+for (const diverged of [false, true]) {
+    test(`native fork ${diverged ? "rejects divergent history" : "preserves backfilled source aliases"}`, async (t) => {
+        const f = await fixture(t)
+        f.history.splice(1, 0, {
+            id: "source-host",
+            type: "synthetic",
+            text: "Host delivery",
+        })
+        f.forkHistory.splice(1, 0, {
+            id: "fork-host",
+            type: "synthetic",
+            text: diverged ? "Different delivery" : "Host delivery",
+        })
+        assignMessageRefs(f.source, fromV2SessionMessages(f.history, "source"))
+        assert.equal(f.source.messageIds.byRawId.get("source-host"), "m00004")
+        await saveSessionState(f.source, f.logger)
+
+        const state = await f.initialize()
+        assert.equal(state.prune.messages.activeBlockIds.size, diverged ? 0 : 1)
+        if (!diverged) {
+            assert.deepEqual([...state.messageIds.byRef].sort(), [
+                ["m00001", "fork-prompt"],
+                ["m00002", "fork-old"],
+                ["m00003", "fork-compress"],
+                ["m00004", "fork-host"],
+            ])
+        }
     })
 }
 
